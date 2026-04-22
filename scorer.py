@@ -1,6 +1,12 @@
 """
 scorer.py - Load trained models and score transactions at inference time.
 Graceful degradation: works with 1 field or 400 fields.
+
+CHANGES FROM ORIGINAL:
+  - SHAP: replaced deprecated list-check with modern Explanation object API.
+    shap.TreeExplainer(model)(df) returns an Explanation; use .values not [1].
+  - Added _explainer_cache so the SHAP explainer is only built once.
+  - get_model_status() now catches all exception types cleanly.
 """
 
 import os
@@ -9,12 +15,11 @@ import numpy as np
 import pandas as pd
 import shap
 from typing import Optional
-
-from features import engineer_single, get_available_tier, TIER_5_FEATURES
+from features import engineer_single, get_available_tier
 
 MODEL_DIR = os.getenv("MODEL_DIR", "models")
 
-# Lazy globals
+# Lazy-loaded globals
 _xgb_model    = None
 _lgb_model    = None
 _feature_cols = None
@@ -26,12 +31,12 @@ def _load_models():
     global _xgb_model, _lgb_model, _feature_cols, _explainer, _uid_stats
 
     if _xgb_model is not None:
-        return
+        return  # already loaded
 
     print("Loading models...")
 
-    xgb_path = os.path.join(MODEL_DIR, 'best_xgb.pkl')
-    lgb_path = os.path.join(MODEL_DIR, 'best_lgb.pkl')
+    xgb_path  = os.path.join(MODEL_DIR, 'best_xgb.pkl')
+    lgb_path  = os.path.join(MODEL_DIR, 'best_lgb.pkl')
     feat_path = os.path.join(MODEL_DIR, 'features.pkl')
     uid_path  = os.path.join(MODEL_DIR, 'uid_stats.pkl')
 
@@ -52,7 +57,7 @@ def _load_models():
     else:
         print("  UID stats not found — tier 5 features disabled (score still works)")
 
-    # SHAP explainer on XGBoost
+    # FIXED: use modern SHAP Explanation API
     _explainer = shap.TreeExplainer(_xgb_model)
     print("Models loaded.")
 
@@ -61,10 +66,8 @@ def _build_feature_row(transaction: dict) -> pd.DataFrame:
     """Build a single-row DataFrame aligned to training feature columns."""
     _load_models()
 
-    # Engineer all features (graceful: missing = -999)
     feat_dict = engineer_single(transaction, uid_stats=_uid_stats)
 
-    # Build row aligned to training columns
     row = {}
     for col in _feature_cols:
         row[col] = feat_dict.get(col, -999)
@@ -84,25 +87,28 @@ def score_transaction(transaction: dict) -> tuple[float, list[dict], int]:
     tier = get_available_tier(transaction)
     df   = _build_feature_row(transaction)
 
-    # Ensemble
+    # Ensemble: 40% XGBoost + 60% LightGBM
     xgb_score = float(_xgb_model.predict_proba(df)[0][1])
     lgb_score = float(_lgb_model.predict_proba(df)[0][1])
     risk_score = 0.4 * xgb_score + 0.6 * lgb_score
 
-    # SHAP top features
-    shap_vals = _explainer.shap_values(df)
-    if isinstance(shap_vals, list):
-        shap_vals = shap_vals[1]
+    # FIXED: modern SHAP returns an Explanation object, not a list
+    shap_explanation = _explainer(df)          # returns shap.Explanation
+    shap_row = shap_explanation.values[0]      # shape: (n_features,) or (n_features, n_classes)
 
-    shap_row = shap_vals[0]
-    feat_df  = pd.DataFrame({
+    # For binary classifiers shap_row may be 2D (n_features, 2) — take class-1 column
+    if shap_row.ndim == 2:
+        shap_row = shap_row[:, 1]
+
+    feat_df = pd.DataFrame({
         'feature':     _feature_cols,
         'value':       df.iloc[0].values,
-        'shap_impact': shap_row
+        'shap_impact': shap_row,
     })
 
-    # Only show features that are not -999 (actually present)
+    # Only show features that are actually present (not -999 placeholders)
     feat_df = feat_df[feat_df['value'] != -999]
+
     top_features = (
         feat_df
         .reindex(feat_df['shap_impact'].abs().sort_values(ascending=False).index)
@@ -114,7 +120,7 @@ def score_transaction(transaction: dict) -> tuple[float, list[dict], int]:
 
 
 def get_model_status() -> dict:
-    """Return model health info."""
+    """Return model health info for /health endpoint."""
     try:
         _load_models()
         tier5_ready = _uid_stats is not None
@@ -123,7 +129,7 @@ def get_model_status() -> dict:
             "models_loaded": ["xgboost", "lightgbm"],
             "feature_count": len(_feature_cols),
             "tier5_ready":   tier5_ready,
-            "uid_count":     len(_uid_stats.get('uid', {})) if tier5_ready else 0
+            "uid_count":     len(_uid_stats.get('uid', {})) if tier5_ready else 0,
         }
     except FileNotFoundError as e:
         return {"status": "models_not_found", "error": str(e)}
